@@ -1,0 +1,16 @@
+[theme]
+base = "light"
+primaryColor = "#087F70"
+backgroundColor = "#F7F8F5"
+secondaryBackgroundColor = "#E8EFEB"
+textColor = "#172823"
+font = "'IBM Plex Sans':https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+headingFont = "'DM Serif Display':https://fonts.googleapis.com/css2?family=DM+Serif+Display&display=swap"
+baseRadius = "8px"
+buttonRadius = "8px"
+showWidgetBorder = true
+
+[theme.sidebar]
+backgroundColor = "#E8EFEB"
+secondaryBackgroundColor = "#F7F8F5"
+textColor = "#172823"
