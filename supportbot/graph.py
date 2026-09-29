@@ -50,18 +50,73 @@ from langchain_openai import ChatOpenAI
 # LangGraph: helper library for building the flowchart of steps shown above.
 from langgraph.graph import END, START, StateGraph
 
+# OpenTelemetry: records each step as a "span" (see observability.py).
+from opentelemetry import trace
+
 # Our own fake data and tools (see tools.py).
 from supportbot.tools import (
-    DEMO_CUSTOMERS,
     ROUTE_LABELS,
     account_snapshot,
     card_snapshot,
+    get_customer,
     loan_estimate,
 )
 
 # A logger prints diagnostic messages (such as why the AI model failed) to the
 # terminal. Customers never see these messages.
 logger = logging.getLogger(__name__)
+
+# A tracer records spans: timed steps inside a request's trace.
+_tracer = trace.get_tracer("northstar.supportbot")
+
+
+def _traced_node(name: str, node):
+    """
+    Wrap a flowchart step so it appears as its own span in the trace,
+    e.g. "node.classify" or "node.loan", with its own timing.
+
+    INPUT:
+        name - the step's name, e.g. "classify"
+        node - the step's function (takes the state, returns updates)
+    OUTPUT:
+        A new function that does exactly the same work, but inside a span.
+        Useful results (intent, escalated, model_warning) are copied onto the span.
+    """
+
+    def run_in_span(state: SupportState) -> dict:
+        with _tracer.start_as_current_span(f"node.{name}") as span:
+            update = node(state)
+            for key in ("intent", "escalated", "model_warning"):
+                if key in update:
+                    span.set_attribute(f"supportbot.{key}", update[key])
+            return update
+
+    return run_in_span
+
+
+def _call_llm(llm: ChatOpenAI, messages: list, purpose: str):
+    """
+    Send messages to the AI model, recorded as an "llm.chat" span.
+
+    INPUT:
+        llm      - the AI model object
+        messages - the conversation to send
+        purpose  - "classify" or "reply", shown on the span
+    OUTPUT:
+        The AI model's answer. If the call fails, the span is marked as an
+        error (red in the trace viewer) and the error is passed on to the caller.
+    """
+    with _tracer.start_as_current_span("llm.chat") as span:
+        span.set_attribute("gen_ai.system", "huggingface")
+        span.set_attribute("gen_ai.request.model", llm.model_name)
+        span.set_attribute("supportbot.llm_purpose", purpose)
+        result = llm.invoke(messages)
+        # Token counts show how much of the free credit each call used.
+        usage = getattr(result, "usage_metadata", None) or {}
+        if usage:
+            span.set_attribute("gen_ai.usage.input_tokens", usage.get("input_tokens", 0))
+            span.set_attribute("gen_ai.usage.output_tokens", usage.get("output_tokens", 0))
+        return result
 
 
 # The five categories ("intents") a customer message can be sorted into.
@@ -275,7 +330,8 @@ def build_support_graph(model_name: str = DEFAULT_HF_MODEL, use_llm: bool = True
         # Otherwise, ask the AI to classify the message. It understands
         # wording the keyword rules might miss.
         try:
-            result = llm.invoke(
+            result = _call_llm(
+                llm,
                 [
                     SystemMessage(
                         content="Classify the banking support request as account, loan, card, general, or escalation. "
@@ -283,7 +339,8 @@ def build_support_graph(model_name: str = DEFAULT_HF_MODEL, use_llm: bool = True
                         "Reply with exactly one of those five words and nothing else."
                     ),
                     HumanMessage(content=state["message"]),
-                ]
+                ],
+                purpose="classify",
             )
             # Pull the category word out of the AI's answer.
             ai_intent = _parse_intent(str(result.content))
@@ -358,12 +415,13 @@ def build_support_graph(model_name: str = DEFAULT_HF_MODEL, use_llm: bool = True
     builder = StateGraph(SupportState)
 
     # Add the boxes: (name of the box, function that runs inside it).
-    builder.add_node("classify", classify_node)
-    builder.add_node("account", account_node)
-    builder.add_node("loan", loan_node)
-    builder.add_node("card", card_node)
-    builder.add_node("general", general_node)
-    builder.add_node("escalation", escalation_node)
+    # _traced_node() makes each box show up as its own step in the trace.
+    builder.add_node("classify", _traced_node("classify", classify_node))
+    builder.add_node("account", _traced_node("account", account_node))
+    builder.add_node("loan", _traced_node("loan", loan_node))
+    builder.add_node("card", _traced_node("card", card_node))
+    builder.add_node("general", _traced_node("general", general_node))
+    builder.add_node("escalation", _traced_node("escalation", escalation_node))
 
     # Arrow: every conversation turn starts at "classify".
     builder.add_edge(START, "classify")
@@ -421,16 +479,18 @@ def _respond(state: SupportState, intent: Intent, evidence: dict, llm: ChatOpenA
         try:
             # Send the AI, in order: the rulebook, the recent chat, and then the
             # current question with the customer's name and the verified tool facts.
-            result = llm.invoke(
+            result = _call_llm(
+                llm,
                 [
                     SystemMessage(content=SYSTEM_PROMPT),
                     *history,
                     HumanMessage(
                         content=f"Customer request: {state['message']}\n"
-                        f"Customer demo profile: {DEMO_CUSTOMERS[state['customer_id']]['name']}\n"
+                        f"Customer demo profile: {get_customer(state['customer_id'])['name']}\n"
                         f"Verified demo tool result: {serialized_evidence}"
                     ),
-                ]
+                ],
+                purpose="reply",
             )
             response = str(result.content)
         except Exception as exc:

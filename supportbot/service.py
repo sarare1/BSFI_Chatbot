@@ -14,10 +14,11 @@ This function:
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 
-from supportbot.observability import get_tracer
+from supportbot.observability import get_tracer, record_request
 
 
 def run_support_request(
@@ -46,9 +47,12 @@ def run_support_request(
                          request was escalated, otherwise an empty string
     """
     tracer = get_tracer()
+    started = time.perf_counter()  # stopwatch start, for the response-time metric
 
     # A "span" is one timed entry in the trace log. Everything inside this
-    # "with" block is recorded under the name "support.request".
+    # "with" block is recorded under the name "support.request". Steps inside
+    # it (classify, tool, db.query, llm.chat) become child spans, so the trace
+    # shows how long each step took.
     with tracer.start_as_current_span("support.request") as span:
         # Run the flowchart. We pass in a notepad with the inputs filled in
         # and the outputs set to empty starting values; the flowchart fills them in.
@@ -71,8 +75,17 @@ def run_support_request(
         span.set_attribute("supportbot.intent", result["intent"])
         span.set_attribute("supportbot.escalated", result["escalated"])
         span.set_attribute("supportbot.demo_mode", True)
+        span.set_attribute("supportbot.model_fallback", result["model_warning"])
         # Read this request's trace ID and write it as a 32-character hex string.
         trace_id = f"{span.get_span_context().trace_id:032x}"
+
+    # Add this request to the metrics (counts and response time).
+    record_request(
+        intent=result["intent"],
+        escalated=result["escalated"],
+        model_fallback=result["model_warning"],
+        duration_seconds=time.perf_counter() - started,
+    )
 
     result["trace_id"] = trace_id
     # For escalations, create a fake ticket number: "DEMO-" + 8 random characters.

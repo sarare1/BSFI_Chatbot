@@ -28,14 +28,18 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from supportbot.graph import DEFAULT_HF_MODEL, build_support_graph
-from supportbot.observability import telemetry_mode
+from supportbot.observability import setup_telemetry, telemetry_mode
 from supportbot.service import run_support_request
-from supportbot.tools import DEMO_CUSTOMERS
+from supportbot.tools import list_customers
 
 # Read private settings (such as HF_TOKEN) from the ".env" file in the project
 # folder and make them available as environment variables. Values already set
 # in the terminal take priority over the file.
 load_dotenv()
+
+# Switch on traces, metrics, and logs (see observability.py). This only does
+# real work on the first run; later re-runs reuse the same setup.
+setup_telemetry()
 
 
 # Browser tab title and icon, and a centred (narrow) page layout.
@@ -71,6 +75,17 @@ def get_graph(model: str, use_llm: bool):
     return build_support_graph(model_name=model, use_llm=use_llm)
 
 
+# @st.cache_data(ttl=60): remember the customer list for 60 seconds, so the
+# database is not queried on every click. New customers added in Supabase
+# appear in the dropdown within a minute.
+@st.cache_data(ttl=60)
+def get_customer_list():
+    """
+    OUTPUT: (customer ID -> name, data source label), see tools.list_customers()
+    """
+    return list_customers()
+
+
 # ---------------------------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------------------------
@@ -78,12 +93,13 @@ with st.sidebar:
     st.markdown("### :material/account_balance: Northstar")
     st.caption("Digital banking support")
 
-    # Dropdown to choose which fake customer we are pretending to be.
+    # Dropdown to choose which fictional customer we are pretending to be.
     # It shows "Alex Morgan (CUST-1001)" but stores just "CUST-1001".
+    customer_names, data_source = get_customer_list()
     customer_id = st.selectbox(
         "Demo customer",
-        options=list(DEMO_CUSTOMERS),
-        format_func=lambda key: f"{DEMO_CUSTOMERS[key]['name']} ({key})",
+        options=list(customer_names),
+        format_func=lambda key: f"{customer_names[key]} ({key})",
     )
 
     # Coloured badge: green "LLM connected" or blue "Simulation mode".
@@ -93,6 +109,7 @@ with st.sidebar:
         color="green" if llm_enabled else "blue",
     )
     st.caption(f"Model: {model_name}" if llm_enabled else "Set HF_TOKEN to enable the LLM")
+    st.caption(f"Customer data: {data_source}")
     st.caption(f"Observability: {telemetry_mode()}")
 
     # Counter showing how many specialist handoffs happened in this chat.

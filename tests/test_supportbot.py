@@ -10,9 +10,10 @@ All tests use use_llm=False, so no AI model or internet connection is needed
 and the results are always the same.
 """
 
+from supportbot import db
 from supportbot.graph import _parse_intent, build_support_graph, classify_intent
 from supportbot.service import run_support_request
-from supportbot.tools import loan_estimate
+from supportbot.tools import account_snapshot, list_customers, loan_estimate
 
 
 def test_classifies_common_support_requests():
@@ -35,6 +36,21 @@ def test_loan_estimate_is_explicitly_illustrative():
     result = loan_estimate("CUST-1001")
     assert result["illustrative_only"] is True
     assert result["estimated_debt_to_income_percent"] == 29.0
+
+
+def test_unreachable_database_falls_back_to_built_in_data(monkeypatch):
+    # Pretend a database is configured but every connection fails. The tools
+    # should quietly switch to the built-in demo data instead of crashing.
+    def fail(*args):
+        raise ConnectionError("database is down")
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://demo:demo@db.invalid/demo")
+    monkeypatch.setattr(db, "fetch_customer", fail)
+    monkeypatch.setattr(db, "fetch_customer_names", fail)
+    assert account_snapshot("CUST-1001")["available_balance"] == 4280.65
+    customers, source = list_customers()
+    assert customers["CUST-1001"] == "Alex Morgan"
+    assert source == "built-in demo data"
 
 
 def test_account_agent_returns_only_demo_tool_data():

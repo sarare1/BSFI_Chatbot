@@ -1,17 +1,21 @@
 """
-tools.py - The chatbot's "tools" and its fake customer database.
+tools.py - The chatbot's "tools" and where they get customer data.
 
 WHAT THIS FILE DOES
 -------------------
-A real bank chatbot would look up customer data from secure bank systems.
-In this demo we do NOT connect to any real system. Instead:
+A real bank chatbot looks up customer data from the bank's systems.
+In this demo, customer data comes from one of two places:
 
-  1. DEMO_CUSTOMERS holds two made-up customers (the "database").
-  2. Three small functions ("tools") read from that data and return
-     just the facts the chatbot needs for one kind of question:
-        - account_snapshot()  -> balance and recent transactions
-        - loan_estimate()     -> a rough, illustrative loan check
-        - card_snapshot()     -> the status of the customer's card
+  - The online PostgreSQL database on Supabase (see db.py), when
+    DATABASE_URL is set in the .env file.
+  - DEMO_CUSTOMERS below, a built-in copy of the same fictional customers,
+    used when no database is set up or the database cannot be reached.
+
+Three small functions ("tools") read that data and return just the facts
+the chatbot needs for one kind of question:
+    - account_snapshot()  -> balance and recent transactions
+    - loan_estimate()     -> a rough, illustrative loan check
+    - card_snapshot()     -> the status of the customer's card
 
 The chatbot (see graph.py) calls one of these tools, then uses the
 result as "evidence" to write its answer. Because the answer is based
@@ -20,16 +24,26 @@ only on the tool result, the bot cannot invent account facts.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+from opentelemetry import trace
+
+from supportbot import db
+from supportbot.observability import record_data_fallback
+
+logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer("northstar.supportbot")
 
 
 # ---------------------------------------------------------------------------
-# FAKE CUSTOMER DATABASE
+# BUILT-IN DEMO DATA (backup copy of the database)
 # ---------------------------------------------------------------------------
 # A Python "dictionary" works like a lookup table: you give it a key
 # (here, a customer ID such as "CUST-1001") and it gives back the details
 # stored under that key. All names, balances, and transactions are fictional.
 # A negative "amount" is money going out; a positive amount is money coming in.
+# db/setup_db.py copies these customers into the online database.
 DEMO_CUSTOMERS: dict[str, dict[str, Any]] = {
     "CUST-1001": {
         "name": "Alex Morgan",
@@ -79,6 +93,70 @@ ROUTE_LABELS = {
 
 
 # ---------------------------------------------------------------------------
+# DATA LOOKUP (database first, built-in data as backup)
+# ---------------------------------------------------------------------------
+def get_customer(customer_id: str) -> dict[str, Any]:
+    """
+    Fetch one customer's full record.
+
+    INPUT:
+        customer_id - e.g. "CUST-1001"
+
+    OUTPUT:
+        The customer's details (name, balance, transactions, ...), in the
+        same shape as a DEMO_CUSTOMERS entry.
+
+    Where the data comes from:
+        1. If DATABASE_URL is set, read from the online database.
+        2. If it is not set, the database cannot be reached, or the customer
+           is not in it, use the built-in DEMO_CUSTOMERS (and log why in the terminal).
+    Raises KeyError if the customer exists in neither place.
+
+    The trace records which source was used ("supportbot.data_source"), and
+    each switch to the backup is counted in the data_fallbacks metric.
+    """
+    with _tracer.start_as_current_span("customer.lookup") as span:
+        if db.database_url():
+            try:
+                customer = db.fetch_customer(customer_id)
+            except Exception as exc:
+                logger.warning("Database unavailable, using built-in demo data: %s", exc)
+                record_data_fallback("db_error")
+            else:
+                if customer is not None:
+                    span.set_attribute("supportbot.data_source", "supabase")
+                    return customer
+                # The customer ID is left out of the message on purpose (privacy).
+                logger.warning("Customer not found in the database; using built-in demo data")
+                record_data_fallback("not_found")
+        span.set_attribute("supportbot.data_source", "built_in")
+        return DEMO_CUSTOMERS[customer_id]
+
+
+def list_customers() -> tuple[dict[str, str], str]:
+    """
+    List all customers for the web page's dropdown.
+
+    INPUT:  none
+    OUTPUT: two things:
+              1. customer ID -> name, e.g. {"CUST-1001": "Alex Morgan", ...}
+              2. where the list came from: "Supabase database" or "built-in demo data"
+            Same database-first, built-in-backup rule as get_customer().
+    """
+    if db.database_url():
+        try:
+            customers = db.fetch_customer_names()
+        except Exception as exc:
+            logger.warning("Database unavailable, using built-in demo data: %s", exc)
+            record_data_fallback("db_error")
+        else:
+            if customers:
+                return customers, "Supabase database"
+            logger.warning("Database has no customers yet (run db/setup_db.py); using built-in demo data")
+    return {customer_id: customer["name"] for customer_id, customer in DEMO_CUSTOMERS.items()}, "built-in demo data"
+
+
+# ---------------------------------------------------------------------------
 # TOOL 1: ACCOUNT SNAPSHOT
 # ---------------------------------------------------------------------------
 def account_snapshot(customer_id: str) -> dict[str, Any]:
@@ -95,8 +173,8 @@ def account_snapshot(customer_id: str) -> dict[str, Any]:
             available_balance    - current balance, e.g. 4280.65
             recent_transactions  - list of recent transactions (date, description, amount)
     """
-    # Find this customer's record in the fake database.
-    customer = DEMO_CUSTOMERS[customer_id]
+    # Find this customer's record (database, or built-in backup).
+    customer = get_customer(customer_id)
     # Return only the account-related fields. Income, debt, etc. are left out
     # on purpose so the chatbot sees only what it needs for this question.
     return {
@@ -133,7 +211,7 @@ def loan_estimate(customer_id: str, proposed_monthly_payment: float = 650.0) -> 
         Example for CUST-1001: (1150 + 650) / 6200 = 0.29  ->  29%
         Lenders commonly use about 43% as an upper limit, so this demo does too.
     """
-    customer = DEMO_CUSTOMERS[customer_id]
+    customer = get_customer(customer_id)
     income = customer["monthly_income"]
 
     # Step 1: work out what share of income would go to debt payments.
@@ -171,7 +249,7 @@ def card_snapshot(customer_id: str) -> dict[str, str]:
             last_four - last 4 digits shown for the card (never the full number)
             support   - a safety message about lost or stolen cards
     """
-    customer = DEMO_CUSTOMERS[customer_id]
+    customer = get_customer(customer_id)
     return {
         "status": customer["card_status"],
         "last_four": customer["account_last_four"],
